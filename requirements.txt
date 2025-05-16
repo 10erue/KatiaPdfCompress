@@ -1,0 +1,6 @@
+img2pdf==0.6.1
+PyMuPDF==1.25.5
+PyQt5==5.15.11
+PyPDF2==3.0.1
+pyinstaller==6.13.0
+Pillow==10.2.0
