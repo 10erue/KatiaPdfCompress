@@ -14,6 +14,12 @@ import fitz  # PyMuPDF
 import shutil
 from datetime import datetime, timedelta
 
+# Extensions de fichiers supportées
+SUPPORTED_EXTENSIONS = {
+    'pdf': 'PDF Files (*.pdf)',
+    'images': 'Image Files (*.jpg *.jpeg *.png *.bmp *.gif *.tiff)'
+}
+
 def get_app_data_dir():
     """Retourne le chemin du dossier AppData pour l'application"""
     app_data = os.path.join(os.getenv('APPDATA'), 'PDFCompress')
@@ -55,6 +61,45 @@ def create_batch_folder():
     batch_dir = os.path.join(get_app_data_dir(), f'batch_{timestamp}')
     os.makedirs(batch_dir, exist_ok=True)
     return batch_dir
+
+def is_image_file(file_path):
+    """Vérifie si le fichier est une image"""
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']
+
+def convert_image_to_pdf(image_path, output_path):
+    """Convertit une image en PDF"""
+    try:
+        # S'assurer que le dossier temporaire existe
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Ouvrir l'image avec PIL pour la compression
+        with Image.open(image_path) as img:
+            # Convertir en niveaux de gris si l'image est en noir et blanc
+            if img.mode == 'RGB':
+                # Vérifier si l'image est principalement en noir et blanc
+                img_gray = img.convert('L')
+                if sum(1 for p in img_gray.getdata() if p < 128) / (img_gray.width * img_gray.height) > 0.95:
+                    img = img_gray
+            
+            # Compresser l'image
+            img_byte_arr = io.BytesIO()
+            if img.mode == 'L':  # Noir et blanc
+                img.save(img_byte_arr, format='JPEG', quality=20, optimize=True)
+            else:  # Couleur
+                img.save(img_byte_arr, format='JPEG', quality=25, optimize=True)
+            img_byte_arr.seek(0)
+            
+            # Convertir l'image compressée en PDF
+            pdf_bytes = img2pdf.convert(img_byte_arr.getvalue())
+            
+            # Sauvegarder le PDF
+            with open(output_path, 'wb') as pdf_file:
+                pdf_file.write(pdf_bytes)
+                
+        return True, "Conversion image vers PDF réussie"
+    except Exception as e:
+        return False, f"Erreur lors de la conversion: {str(e)}"
 
 def compress_pdf(input_path, output_path, max_size_mb=1):
     """
@@ -190,7 +235,7 @@ class PDFCompressorGUI(QMainWindow):
         drop_container.setLayout(drop_layout)
         
         # Label de drop
-        self.drop_label = QLabel("Glissez-déposez vos fichiers PDF ici\nou cliquez pour sélectionner")
+        self.drop_label = QLabel("Glissez-déposez vos fichiers PDF ou images ici\nou cliquez pour sélectionner")
         self.drop_label.setAlignment(Qt.AlignCenter)
         self.drop_label.setWordWrap(True)
         self.drop_label.mousePressEvent = self.select_files
@@ -244,18 +289,24 @@ class PDFCompressorGUI(QMainWindow):
         files = []
         for url in event.mimeData().urls():
             file_path = url.toLocalFile()
-            if file_path.lower().endswith('.pdf'):
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == '.pdf' or ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']:
                 files.append(file_path)
         
         if files:
             self.add_files(files)
     
     def select_files(self, event):
+        # Créer le filtre pour les fichiers
+        file_filter = ";;".join([
+            f"{desc} ({ext})" for ext, desc in SUPPORTED_EXTENSIONS.items()
+        ])
+        
         files, _ = QFileDialog.getOpenFileNames(
             self,
-            "Sélectionner des fichiers PDF",
+            "Sélectionner des fichiers PDF ou images",
             "",
-            "PDF Files (*.pdf)"
+            file_filter
         )
         if files:
             self.add_files(files)
@@ -268,7 +319,7 @@ class PDFCompressorGUI(QMainWindow):
     
     def update_drop_label(self):
         if not self.files_to_process:
-            self.drop_label.setText("Glissez-déposez vos fichiers PDF ici\nou cliquez pour sélectionner")
+            self.drop_label.setText("Glissez-déposez vos fichiers PDF ou images ici\nou cliquez pour sélectionner")
         else:
             files_text = "\n".join([f"• {os.path.basename(f)}" for f in self.files_to_process])
             self.drop_label.setText(f"Fichiers sélectionnés ({len(self.files_to_process)}):\n{files_text}")
@@ -300,12 +351,26 @@ class PDFCompressorGUI(QMainWindow):
         error_count = 0
         
         for i, input_path in enumerate(self.files_to_process, 1):
+            temp_pdf = None
             try:
                 self.log_message(f"Traitement du fichier {i}/{len(self.files_to_process)}: {os.path.basename(input_path)}")
                 
                 # Nom du fichier de sortie
                 output_filename = f"compressed_{os.path.basename(input_path)}"
+                if not output_filename.lower().endswith('.pdf'):
+                    output_filename = os.path.splitext(output_filename)[0] + '.pdf'
                 output_path = os.path.join(batch_dir, output_filename)
+                
+                # Si c'est une image, la convertir d'abord en PDF
+                if is_image_file(input_path):
+                    self.log_message(f"Conversion de l'image en PDF...")
+                    temp_pdf = os.path.join(get_temp_dir(), f"temp_{i}.pdf")
+                    success, message = convert_image_to_pdf(input_path, temp_pdf)
+                    if not success:
+                        error_count += 1
+                        self.log_message(f"✗ {message}")
+                        continue
+                    input_path = temp_pdf
                 
                 # Compression
                 success, message = compress_pdf(
@@ -324,6 +389,13 @@ class PDFCompressorGUI(QMainWindow):
             except Exception as e:
                 error_count += 1
                 self.log_message(f"✗ Erreur lors du traitement de {os.path.basename(input_path)}: {str(e)}")
+            finally:
+                # Nettoyer le fichier temporaire si c'était une image
+                if temp_pdf and os.path.exists(temp_pdf):
+                    try:
+                        os.unlink(temp_pdf)
+                    except:
+                        pass
         
         # Résumé
         self.log_message(f"\nTraitement terminé:")
